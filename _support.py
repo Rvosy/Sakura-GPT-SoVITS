@@ -1,0 +1,834 @@
+"""Stdlib-only helpers owned by the GPT-SoVITS plugin process."""
+
+from __future__ import annotations
+
+import ipaddress
+import json
+import os
+import re
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import urllib.error
+import urllib.request
+import wave
+from dataclasses import dataclass, field, replace
+from pathlib import Path, PurePosixPath, PureWindowsPath
+from typing import Any, Callable, Mapping
+from urllib.parse import urlencode, urlparse, urlunparse
+
+from sakura_http import urlopen_direct_for_loopback as urlopen_current_proxy
+
+try:
+    from ._runtime_profile import RuntimeProfileError, prepare_managed_profile
+except ImportError:  # pragma: no cover - loose plugin execution
+    from _runtime_profile import RuntimeProfileError, prepare_managed_profile
+
+
+DEFAULT_TONE = "中性"
+DEFAULT_GPT_SOVITS_BASE_URL = "http://127.0.0.1:9880"
+DEFAULT_GPT_SOVITS_TTS_PATH = "/tts"
+_LATIN = re.compile(r"[A-Za-z]")
+
+
+class OperationCancelled(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True)
+class ToneReference:
+    tone: str
+    ref_audio_path: Path
+    ref_text: str
+    ref_lang: str
+
+
+@dataclass
+class _TTSRequest:
+    text: str
+    tone: str | None
+    request_id: str = ""
+    cancelled: bool = False
+
+
+@dataclass(frozen=True)
+class GPTSoVITSTTSSettings:
+    enabled: bool
+    api_url: str
+    ref_audio_path: Path
+    ref_text_path: Path
+    ref_text: str
+    provider: str = "gpt-sovits"
+    gpt_model_path: Path | None = None
+    sovits_model_path: Path | None = None
+    work_dir: Path | None = None
+    python_path: Path | None = None
+    tts_config_path: Path | None = None
+    ref_lang: str = "ja"
+    text_lang: str = "ja"
+    timeout_seconds: int = 60
+    tone_references: dict[str, list[ToneReference]] = field(default_factory=dict)
+    custom_base_url: str | None = None
+    tts_path: str = DEFAULT_GPT_SOVITS_TTS_PATH
+    remote_reference_root: str | None = None
+    character_id: str = ""
+    character_package_dir: Path | None = None
+
+    def validate(self) -> None:
+        endpoint = urlparse(self.api_url)
+        if endpoint.scheme not in {"http", "https"} or not endpoint.hostname:
+            raise ValueError("TTS_CONFIG_INVALID")
+        if not 1 <= self.timeout_seconds <= 300:
+            raise ValueError("TTS_CONFIG_INVALID")
+        if not self.ref_text or not self.ref_lang or not self.text_lang:
+            raise ValueError("TTS_CHARACTER_CONFIG_INVALID")
+        references = [
+            item for values in self.tone_references.values() for item in values
+        ] or [ToneReference(DEFAULT_TONE, self.ref_audio_path, self.ref_text, self.ref_lang)]
+        if any(not item.ref_audio_path.is_file() or not item.ref_text for item in references):
+            raise ValueError("TTS_CHARACTER_CONFIG_INVALID")
+        if self.custom_base_url is None:
+            if self.work_dir is None or not self.work_dir.is_dir():
+                raise ValueError("TTS_RUNTIME_INVALID")
+            if self.python_path is not None and not self.python_path.is_file():
+                raise ValueError("TTS_RUNTIME_INVALID")
+            if self.tts_config_path is not None and not self.tts_config_path.is_file():
+                raise ValueError("TTS_RUNTIME_INVALID")
+            if self.gpt_model_path is not None and not self.gpt_model_path.is_file():
+                raise ValueError("TTS_CHARACTER_CONFIG_INVALID")
+            if self.sovits_model_path is not None and not self.sovits_model_path.is_file():
+                raise ValueError("TTS_CHARACTER_CONFIG_INVALID")
+
+
+def is_loopback_base_url(base_url: str) -> bool:
+    host = (urlparse(base_url).hostname or "").strip().lower().rstrip(".")
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def _open_url(
+    url: str | urllib.request.Request,
+    *,
+    timeout: float,
+) -> object:
+    return urlopen_current_proxy(url, timeout=timeout)
+
+
+def _read_url(
+    request: str | urllib.request.Request,
+    *,
+    timeout: float,
+    cancel_checker: Callable[[], None] | None = None,
+) -> tuple[bytes, int | None]:
+    if cancel_checker is None:
+        with _open_url(request, timeout=timeout) as response:
+            return response.read(), getattr(response, "status", None)
+    done = threading.Event()
+    abort = threading.Event()
+    state: dict[str, Any] = {}
+    lock = threading.Lock()
+
+    def read() -> None:
+        chunks: list[bytes] = []
+        try:
+            with _open_url(request, timeout=timeout) as response:
+                with lock:
+                    state["response"] = response
+                state["status"] = getattr(response, "status", None)
+                while not abort.is_set():
+                    chunk = response.read(64 * 1024)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                if not abort.is_set():
+                    state["body"] = b"".join(chunks)
+        except BaseException as error:
+            if not abort.is_set():
+                state["error"] = error
+        finally:
+            done.set()
+
+    threading.Thread(target=read, name="gpt-sovits-http-read", daemon=True).start()
+    try:
+        while not done.wait(0.05):
+            cancel_checker()
+        cancel_checker()
+    except BaseException:
+        abort.set()
+        with lock:
+            response = state.get("response")
+        try:
+            if response is not None:
+                response.close()
+        except Exception:
+            pass
+        raise
+    error = state.get("error")
+    if isinstance(error, BaseException):
+        raise error
+    return bytes(state.get("body", b"")), state.get("status")
+
+
+def terminate_process_tree(process: subprocess.Popen[Any], *, timeout: float) -> None:
+    # Core also imports this module to validate legacy configuration. Only the
+    # running plugin needs the public SDK helper on its isolated import path.
+    from sakura_process import terminate_process_tree as terminate_owned_tree
+
+    terminate_owned_tree(process, timeout=timeout)
+
+
+def find_usable_runtime_python(runtime_dir: Path) -> Path | None:
+    names = (
+        ("python.exe", "python")
+        if sys.platform == "win32"
+        else ("bin/python3", "bin/python", "python3", "python")
+    )
+    for name in names:
+        candidate = runtime_dir / name
+        if candidate.is_file() and (sys.platform == "win32" or os.access(candidate, os.X_OK)):
+            return candidate
+    return None
+
+
+def _subprocess_path(value: str | Path) -> str:
+    text = str(value)
+    if sys.platform == "win32":
+        if text.startswith("\\\\?\\UNC\\"):
+            text = "\\\\" + text[8:]
+        elif text.startswith("\\\\?\\"):
+            text = text[4:]
+    return os.path.normpath(text)
+
+
+def user_facing_path(value: str | Path) -> str:
+    return _subprocess_path(value) if str(value) else ""
+
+
+def _verify_wav(path: Path) -> bool:
+    try:
+        if not path.is_file() or path.stat().st_size <= 0:
+            return False
+        with wave.open(str(path), "rb") as handle:
+            return (
+                handle.getnchannels() in (1, 2)
+                and handle.getsampwidth() > 0
+                and handle.getframerate() > 0
+            )
+    except (OSError, EOFError, wave.Error):
+        return False
+
+
+@dataclass(frozen=True)
+class _Endpoint:
+    base_url: str
+    synthesis_url: str
+    kind: str
+
+
+def _elapsed_ms(started_at: float) -> str:
+    elapsed = max(0.0, (time.monotonic() - started_at) * 1000)
+    return f"{elapsed:.2f}".rstrip("0").rstrip(".")
+
+
+class _ManagedRuntime:
+    def __init__(
+        self,
+        settings: GPTSoVITSTTSSettings,
+        *,
+        base_dir: Path,
+        is_closed: Callable[[], bool],
+        diagnostic: Callable[[str, str, Mapping[str, str]], None] | None = None,
+    ) -> None:
+        self.settings = settings
+        self._base_dir = base_dir
+        self._is_closed = is_closed
+        self._diagnostic = diagnostic
+        self._server_process: subprocess.Popen[Any] | None = None
+        self._log_handle: Any = None
+        self._weights_ready = False
+        self._service_ready = False
+
+    def ensure_available(self, fail: Callable[[str], None]) -> bool:
+        if self._is_closed():
+            return False
+        process = self._server_process
+        if self._service_ready and process is not None and process.poll() is None:
+            return True
+        started_at = time.monotonic()
+        self._report(
+            "tts.service.started",
+            "info",
+            {"stage": "runtime_start", "status": "starting"},
+        )
+        parsed = urlparse(self.settings.api_url)
+        host = parsed.hostname or "127.0.0.1"
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        if process is None:
+            if _probe_tcp(host, port, min(self.settings.timeout_seconds, 3)):
+                self._fail_service(fail, "TTS_PORT_OCCUPIED", started_at, "PortOccupiedError")
+                return False
+            start_errors: list[str] = []
+            try:
+                started = self._start(start_errors.append)
+            except OSError as error:
+                self._fail_service(
+                    fail,
+                    "TTS_RUNTIME_START_FAILED",
+                    started_at,
+                    type(error).__name__,
+                )
+                return False
+            if not started:
+                reason_code = start_errors[-1] if start_errors else "TTS_RUNTIME_START_FAILED"
+                error_type = (
+                    "RuntimeConfigurationError"
+                    if reason_code == "TTS_RUNTIME_INVALID"
+                    else "RuntimeProfileError"
+                    if reason_code != "TTS_RUNTIME_START_FAILED"
+                    else "RuntimeStartError"
+                )
+                self._fail_service(fail, reason_code, started_at, error_type)
+                return False
+            process = self._server_process
+        assert process is not None
+        self._report(
+            "tts.service.waiting_ready",
+            "info",
+            {"stage": "runtime_start", "status": "waiting"},
+        )
+        deadline = time.monotonic() + self.settings.timeout_seconds
+        while time.monotonic() < deadline:
+            if self._is_closed():
+                return False
+            if process.poll() is not None:
+                self._fail_service(
+                    fail,
+                    "TTS_RUNTIME_EXITED",
+                    started_at,
+                    "ChildProcessExit",
+                )
+                return False
+            if _probe_http(self.settings.api_url, 1):
+                self._service_ready = True
+                self._report(
+                    "tts.service.ready",
+                    "info",
+                    {
+                        "stage": "runtime_start",
+                        "status": "ready",
+                        "elapsed_ms": _elapsed_ms(started_at),
+                    },
+                )
+                return True
+            time.sleep(0.05)
+        self._fail_service(fail, "TTS_RUNTIME_TIMEOUT", started_at, "TimeoutError")
+        return False
+
+    def ensure_weights(
+        self,
+        fail: Callable[[str], None],
+        cancel_checker: Callable[[], None] | None,
+    ) -> bool:
+        if self._weights_ready:
+            return True
+        started_at = time.monotonic()
+        self._report(
+            "tts.weights.loading",
+            "info",
+            {"stage": "weights", "status": "loading"},
+        )
+        for endpoint, path in (
+            ("set_gpt_weights", self.settings.gpt_model_path),
+            ("set_sovits_weights", self.settings.sovits_model_path),
+        ):
+            if path is None:
+                continue
+            if cancel_checker is not None:
+                cancel_checker()
+            parsed = urlparse(self.settings.api_url)
+            base_path = parsed.path.rsplit("/", 1)[0]
+            url = urlunparse(parsed._replace(
+                path=f"{base_path}/{endpoint}" if base_path else f"/{endpoint}",
+                query=urlencode({"weights_path": _subprocess_path(path)}),
+            ))
+            try:
+                _read_url(
+                    urllib.request.Request(url, method="GET"),
+                    timeout=self.settings.timeout_seconds,
+                    cancel_checker=cancel_checker,
+                )
+            except Exception as error:
+                fail("TTS_WEIGHTS_UNAVAILABLE")
+                self._report(
+                    "tts.weights.failed",
+                    "warning",
+                    {
+                        "stage": "gpt_weights" if endpoint == "set_gpt_weights" else "sovits_weights",
+                        "status": "failed",
+                        "reason_code": "TTS_WEIGHTS_UNAVAILABLE",
+                        "error_type": type(error).__name__,
+                        "elapsed_ms": _elapsed_ms(started_at),
+                    },
+                )
+                return False
+        self._weights_ready = True
+        self._report(
+            "tts.weights.ready",
+            "info",
+            {
+                "stage": "weights",
+                "status": "ready",
+                "elapsed_ms": _elapsed_ms(started_at),
+            },
+        )
+        return True
+
+    def _fail_service(
+        self,
+        fail: Callable[[str], None],
+        reason_code: str,
+        started_at: float,
+        error_type: str,
+    ) -> None:
+        fail(reason_code)
+        self._report(
+            "tts.service.failed",
+            "warning",
+            {
+                "stage": "runtime_start",
+                "source_file": "plugins/builtin/sakura_gpt_sovits/_support.py",
+                "source_line": sys._getframe(1).f_lineno,
+                "status": "failed",
+                "code": reason_code,
+                "reason_code": reason_code,
+                "timeout_ms": round(self.settings.timeout_seconds * 1000),
+                **(
+                    {"probe_outcome": "timeout"}
+                    if reason_code == "TTS_RUNTIME_TIMEOUT"
+                    else {}
+                ),
+                **(
+                    {"child_exited": True, "exit_code": self._server_process.poll()}
+                    if reason_code == "TTS_RUNTIME_EXITED" and self._server_process
+                    else {}
+                ),
+                **getattr(self, "_start_diagnostic", {}),
+                "error_type": error_type,
+                "elapsed_ms": _elapsed_ms(started_at),
+            },
+        )
+
+    def _report(
+        self,
+        event: str,
+        severity: str,
+        attributes: Mapping[str, str],
+    ) -> None:
+        if self._diagnostic is None:
+            return
+        try:
+            if severity in {"warning", "error"} and self._server_process is not None:
+                from sakura_process import process_failure_diagnostics
+
+                attributes = {**attributes, **process_failure_diagnostics(self._base_dir / "gpt-sovits.log", getattr(self, "_log_start_offset", 0))}
+            self._diagnostic(event, severity, attributes)
+        except Exception:
+            return
+
+    def restart_after_failure(self, status: int, body: str) -> bool:
+        if status != 400 or "tts failed" not in body.lower() or "broken pipe" not in body.lower():
+            return False
+        self.close()
+        self._service_ready = False
+        self._weights_ready = False
+        return True
+
+    def _start(self, fail: Callable[[str], None]) -> bool:
+        self._start_diagnostic = {}
+        work_dir = self.settings.work_dir
+        if work_dir is None or not work_dir.is_dir():
+            fail("TTS_RUNTIME_INVALID")
+            return False
+        python = self.settings.python_path or find_usable_runtime_python(work_dir / "runtime")
+        script = work_dir / "api_v2.py"
+        if python is None or not python.is_file() or not script.is_file():
+            fail("TTS_RUNTIME_INVALID")
+            return False
+        try:
+            tts_config_path = prepare_managed_profile(
+                work_dir,
+                runtime_python=python,
+                configured_path=self.settings.tts_config_path,
+                require_cuda=work_dir.name.casefold() == "g50",
+            )
+        except RuntimeProfileError as error:
+            self._start_diagnostic = {
+                "stage": "device_probe",
+                "reason_code": error.reason_code,
+                "timeout_ms": 90000,
+                "source_file": "plugins/builtin/sakura_gpt_sovits/_runtime_profile.py",
+                "probe_outcome": "timeout"
+                if error.reason_code == "TTS_DEVICE_PROBE_TIMEOUT"
+                else "spawn_failed"
+                if error.reason_code == "TTS_DEVICE_PROBE_START_FAILED"
+                else "invalid_output"
+                if error.reason_code == "TTS_DEVICE_PROBE_OUTPUT_INVALID"
+                else "unavailable",
+            }
+            if error.exit_code is not None:
+                self._start_diagnostic["exit_code"] = error.exit_code
+            tb = error.__traceback__
+            while tb is not None:
+                if tb.tb_frame.f_code.co_filename.endswith("_runtime_profile.py"):
+                    self._start_diagnostic["source_line"] = tb.tb_lineno
+                tb = tb.tb_next
+            fail(str(error))
+            return False
+        command = [_subprocess_path(python), _subprocess_path(script)]
+        if tts_config_path is not None:
+            command.extend(["-c", _subprocess_path(tts_config_path)])
+        parsed = urlparse(self.settings.api_url)
+        command.extend(["-a", "127.0.0.1" if parsed.hostname == "localhost" else str(parsed.hostname)])
+        if parsed.port is not None:
+            command.extend(["-p", str(parsed.port)])
+        log_path = self._base_dir / "gpt-sovits.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log = log_path.open("a", encoding="utf-8")
+        self._log_start_offset = log.tell()
+        numba_cache = self._base_dir / "cache" / "numba"
+        numba_cache.mkdir(parents=True, exist_ok=True)
+        environment = os.environ.copy()
+        environment.pop("PYTHONPATH", None)
+        environment.pop("PYTHONHOME", None)
+        environment["PYTHONIOENCODING"] = "utf-8"
+        environment["NUMBA_CACHE_DIR"] = _subprocess_path(numba_cache)
+        kwargs: dict[str, Any] = {
+            "cwd": _subprocess_path(work_dir),
+            "stdin": subprocess.DEVNULL,
+            "stdout": log,
+            "stderr": subprocess.STDOUT,
+            "text": True,
+            "encoding": "utf-8",
+            "errors": "replace",
+            "env": environment,
+        }
+        if os.name == "nt":
+            kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(
+                subprocess,
+                "CREATE_NEW_PROCESS_GROUP",
+                0,
+            )
+        try:
+            self._server_process = subprocess.Popen(command, **kwargs)
+        except OSError:
+            log.close()
+            fail("TTS_RUNTIME_START_FAILED")
+            return False
+        self._log_handle = log
+        return True
+
+    def close(self) -> None:
+        process = self._server_process
+        self._server_process = None
+        if process is not None and process.poll() is None:
+            terminate_process_tree(process, timeout=0.5)
+        if self._log_handle is not None:
+            self._log_handle.close()
+            self._log_handle = None
+
+
+class GptSovitsEndpointResolver:
+    def __init__(
+        self,
+        settings: GPTSoVITSTTSSettings,
+        *,
+        base_dir: Path,
+        resource_manager: object,
+        is_closed: Callable[[], bool],
+        diagnostic: Callable[[str, str, Mapping[str, str]], None] | None = None,
+    ) -> None:
+        del resource_manager
+        base_url = settings.custom_base_url or DEFAULT_GPT_SOVITS_BASE_URL
+        synthesis_url = f"{base_url.rstrip('/')}{settings.tts_path}"
+        self.endpoint = _Endpoint(
+            base_url,
+            synthesis_url,
+            "custom" if settings.custom_base_url is not None else "managed",
+        )
+        self.settings = replace(settings, api_url=synthesis_url)
+        self.runtime = (
+            None
+            if settings.custom_base_url is not None
+            else _ManagedRuntime(
+                self.settings,
+                base_dir=base_dir,
+                is_closed=is_closed,
+                diagnostic=diagnostic,
+            )
+        )
+        self._custom_checked = False
+        self._is_closed = is_closed
+
+    def ensure_available(self, fail: Callable[[str], None]) -> bool:
+        if self.runtime is not None:
+            self.runtime.settings = self.settings
+            return self.runtime.ensure_available(fail)
+        if self._custom_checked:
+            return True
+        parsed = urlparse(self.endpoint.base_url)
+        host = parsed.hostname or ""
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        timeout = min(self.settings.timeout_seconds, 3)
+        if not host or not _probe_tcp(host, port, timeout) or not _probe_http(self.endpoint.synthesis_url, timeout):
+            fail("TTS_RUNTIME_UNAVAILABLE")
+            return False
+        self._custom_checked = True
+        return True
+
+    def ensure_character_weights(
+        self,
+        fail: Callable[[str], None],
+        *,
+        cancel_checker: Callable[[], None] | None,
+    ) -> bool:
+        if self.runtime is None:
+            return True
+        return self.runtime.ensure_weights(fail, cancel_checker)
+
+    def restart_owned_after_http_failure(self, status: int, body: str) -> bool:
+        return self.runtime is not None and self.runtime.restart_after_failure(status, body)
+
+    def close(self) -> None:
+        if self.runtime is not None:
+            self.runtime.close()
+
+
+class GptSovitsEndpointSupervisor:
+    def __init__(self, resolver: GptSovitsEndpointResolver) -> None:
+        self.resolver = resolver
+        self.settings = resolver.settings
+
+    @property
+    def endpoint_kind(self) -> str:
+        return self.resolver.endpoint.kind
+
+    def _ensure_service_available(self, fail: Callable[[str], None]) -> bool:
+        self.resolver.settings = self.settings
+        return self.resolver.ensure_available(fail)
+
+    def _ensure_character_weights(
+        self,
+        fail: Callable[[str], None],
+        *,
+        cancel_checker: Callable[[], None] | None = None,
+    ) -> bool:
+        return self.resolver.ensure_character_weights(
+            fail,
+            cancel_checker=cancel_checker,
+        )
+
+    def _restart_local_service_after_http_failure(self, status: int, body: str) -> bool:
+        return self.resolver.restart_owned_after_http_failure(status, body)
+
+
+class GPTSoVITSSynthesisEngine:
+    def synthesize(
+        self,
+        queue: object,
+        request: _TTSRequest,
+        *,
+        fail: Callable[[str], None],
+        skip: Callable[[str], None],
+    ) -> Path | None:
+        del skip
+        supervisor = getattr(queue, "_supervisor")
+        settings = getattr(queue, "settings")
+
+        def check_cancelled() -> None:
+            if request.cancelled:
+                raise OperationCancelled("TTS job cancelled")
+
+        started_at = time.monotonic()
+
+        def diagnose(code: str, reason: str, stage: str, error_type: str) -> None:
+            reporter = getattr(queue, "_report", None)
+            if reporter is not None:
+                reporter(
+                    "tts.synthesis.failed",
+                    "warning",
+                    {
+                        "code": code,
+                        "reason_code": reason,
+                        "stage": stage,
+                        "error_type": error_type,
+                        "elapsed_ms": round((time.monotonic() - started_at) * 1000),
+                        "timeout_ms": round(settings.timeout_seconds * 1000),
+                        "source_file": "plugins/builtin/sakura_gpt_sovits/_support.py",
+                        "source_line": sys._getframe(1).f_lineno,
+                    },
+                )
+            fail(code)
+
+        restart_attempted = False
+        while True:
+            check_cancelled()
+            if not supervisor._ensure_service_available(fail):
+                return None
+            if not supervisor._ensure_character_weights(fail):
+                return None
+            reference = getattr(queue, "_select_reference")(request.tone)
+            try:
+                reference_path = _reference_path(settings, reference.ref_audio_path)
+            except ValueError as error:
+                fail(str(error))
+                return None
+            text_lang = settings.text_lang.strip().lower() or "ja"
+            if text_lang in {"ja", "all_ja", "zh", "all_zh", "ko", "all_ko", "yue", "all_yue"} and _LATIN.search(request.text):
+                text_lang = "auto_yue" if text_lang in {"yue", "all_yue"} else "auto"
+            payload = {
+                "text": request.text,
+                "text_lang": text_lang,
+                "ref_audio_path": reference_path,
+                "prompt_text": reference.ref_text,
+                "prompt_lang": reference.ref_lang,
+                "text_split_method": "cut1",
+                "batch_size": 1,
+                "media_type": "wav",
+                "streaming_mode": False,
+                "top_k": 15,
+                "top_p": 1,
+                "temperature": 1,
+                "repetition_penalty": 1.2,
+            }
+            http_request = urllib.request.Request(
+                settings.api_url,
+                data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                method="POST",
+                headers={"Content-Type": "application/json"},
+            )
+            try:
+                audio, _status = _read_url(
+                    http_request,
+                    timeout=settings.timeout_seconds,
+                    cancel_checker=check_cancelled,
+                )
+                break
+            except urllib.error.HTTPError as error:
+                body = error.read().decode("utf-8", errors="replace")
+                if (
+                    not restart_attempted
+                    and supervisor._restart_local_service_after_http_failure(
+                        error.code, body
+                    )
+                ):
+                    restart_attempted = True
+                    continue
+                diagnose(
+                    "TTS_SYNTHESIS_FAILED",
+                    "TTS_HTTP_FAILED",
+                    "synthesis_http",
+                    type(error).__name__,
+                )
+                return None
+            except (urllib.error.URLError, TimeoutError, OSError) as error:
+                cause = getattr(error, "reason", error)
+                diagnose(
+                    "TTS_RUNTIME_UNAVAILABLE",
+                    "TTS_HTTP_TIMEOUT"
+                    if isinstance(cause, TimeoutError)
+                    else "TTS_HTTP_CONNECTION_FAILED",
+                    "synthesis_http",
+                    type(error).__name__,
+                )
+                return None
+        if not audio:
+            diagnose(
+                "TTS_AUDIO_INVALID",
+                "TTS_AUDIO_EMPTY",
+                "audio_validation",
+                "AudioValidationError",
+            )
+            return None
+        cache_dir = Path(getattr(queue, "_cache_dir"))
+        with tempfile.NamedTemporaryFile(
+            prefix="gpt-sovits-",
+            suffix=".wav",
+            delete=False,
+            dir=str(cache_dir),
+        ) as handle:
+            handle.write(audio)
+            path = Path(handle.name)
+        if not _verify_wav(path):
+            path.unlink(missing_ok=True)
+            diagnose(
+                "TTS_AUDIO_INVALID",
+                "TTS_AUDIO_FORMAT_INVALID",
+                "audio_validation",
+                "AudioValidationError",
+            )
+            return None
+        return path
+
+
+def _reference_path(settings: GPTSoVITSTTSSettings, path: Path) -> str:
+    custom = settings.custom_base_url
+    if custom is None or is_loopback_base_url(custom):
+        return _subprocess_path(path)
+    root = str(settings.remote_reference_root or "").strip()
+    package = settings.character_package_dir
+    if not root or package is None or not settings.character_id:
+        raise ValueError("TTS_REFERENCE_AUDIO_UNAVAILABLE")
+    try:
+        relative = path.resolve(strict=True).relative_to(package.resolve(strict=True))
+    except (OSError, ValueError) as error:
+        raise ValueError("TTS_REFERENCE_AUDIO_UNAVAILABLE") from error
+    parts = (settings.character_id, *relative.parts)
+    if root.startswith("\\\\") or (len(root) >= 2 and root[1] == ":") or "\\" in root:
+        return str(PureWindowsPath(root).joinpath(*parts))
+    return str(PurePosixPath(root).joinpath(*parts))
+
+
+def _probe_tcp(host: str, port: int, timeout: float) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except (OSError, TimeoutError):
+        return False
+
+
+def _probe_http(api_url: str, timeout: float) -> bool:
+    parsed = urlparse(api_url)
+    base_path = parsed.path.rsplit("/", 1)[0]
+    request = urllib.request.Request(
+        urlunparse(parsed._replace(path=base_path or "/", query="")),
+        method="GET",
+    )
+    try:
+        with _open_url(request, timeout=timeout):
+            pass
+    except urllib.error.HTTPError:
+        return True
+    except (urllib.error.URLError, TimeoutError, OSError):
+        return False
+    return True
+
+
+try:
+    from ._bundle import (
+        TTSBundleResource,
+        installed_bundle_result,
+        recommend_gpt_sovits_bundle,
+    )
+except ImportError:
+    from _bundle import (  # type: ignore[no-redef]
+        TTSBundleResource,
+        installed_bundle_result,
+        recommend_gpt_sovits_bundle,
+    )
