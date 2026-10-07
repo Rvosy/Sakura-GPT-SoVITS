@@ -1021,7 +1021,7 @@ def _parse_character_voice(
     tone_refs_path = Path(character.resolve_resource(character_id, tone_refs_relative))
     package_dir = _package_root(tone_refs_path, tone_refs_relative)
     references: dict[str, list[ToneReference]] = {}
-    resource_paths = [tone_refs_relative]
+    resource_paths = [tone_refs_path]
     for raw_line in tone_refs_path.read_text(encoding="utf-8").splitlines():
         line = raw_line.strip()
         if not line or line.startswith("#"):
@@ -1031,7 +1031,7 @@ def _parse_character_voice(
             raise ValueError("TTS_CHARACTER_CONFIG_INVALID")
         audio_relative, language, text, tone = parts
         audio_path = Path(character.resolve_resource(character_id, audio_relative))
-        resource_paths.append(audio_relative)
+        resource_paths.append(audio_path)
         references.setdefault(tone, []).append(
             ToneReference(tone, audio_path, text, language.lower())
         )
@@ -1051,12 +1051,14 @@ def _parse_character_voice(
         gpt_model_path=_character_resource(character, character_id, extension.get("gptModel")),
         sovits_model_path=_character_resource(character, character_id, extension.get("sovitsModel")),
     )
-    resource_paths.extend(extension[key] for key in ("gptModel", "sovitsModel") if extension.get(key))
+    resource_paths.extend(path for path in (voice.gpt_model_path, voice.sovits_model_path) if path is not None)
     requirements = [{"kind": "tts", "type": "gpt-sovits.models@1", "plugins": [
         {"id": PROVIDER_ID, "name": "GPT-SoVITS"}, {"id": "sakura.tts.genie", "name": "Genie"},
         {"id": "sakura.tts.sakuratts", "name": "SakuraTTS"},
     ]}] if voice.gpt_model_path is not None and voice.sovits_model_path is not None else []
-    character.declare_resources(character_id, {"kind": "tts", "paths": resource_paths, "pluginRequirements": requirements})
+    character.declare_resources(character_id, {"kind": "tts",
+        "paths": [path.relative_to(package_dir).as_posix() for path in resource_paths],
+        "pluginRequirements": requirements})
     return voice
 
 
