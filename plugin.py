@@ -1,6 +1,8 @@
 from __future__ import annotations
+from sakura_provider_errors import provider_failure
 
 import os
+import sys
 import queue
 import re
 import threading
@@ -100,6 +102,7 @@ class _Job:
     ) -> None:
         self.request = dict(request)
         self.voice = voice
+        self._context = context
         self._artifacts = artifacts
         self._allocation = artifacts.allocate({"mediaType": "audio/wav", "suffix": ".wav"})
         self.output_path = Path(self._allocation["path"])
@@ -110,6 +113,7 @@ class _Job:
         self._request: _TTSRequest | None = None
         self._state = "running"
         self._error_code = "TTS_SYNTHESIS_FAILED"
+        self._diagnostics = {}
         self._disposer = context.effect(self.close)
 
     @property
@@ -136,9 +140,10 @@ class _Job:
         if cancelled:
             self._disposer()
 
-    def fail(self, error_code: str) -> None:
+    def fail(self, error_code: object, error: BaseException | None = None) -> None:
         with self._lock:
             self._error_code = _stable_error_code(error_code)
+            self._diagnostics = provider_failure(self._error_code, error if error is not None else error_code)["diagnostics"]
             self._state = "cancelled" if self._cancelled.is_set() else "failed"
             self._done.set()
         self._disposer()
@@ -177,12 +182,13 @@ class _Job:
             if state == "succeeded":
                 try:
                     artifact = self._artifacts.commit(self._allocation["artifactId"])
-                except Exception:
-                    return {"state": "failed", "errorCode": "TTS_ARTIFACT_INVALID"}
+                except Exception as error:
+                    self._context.get("sakura.host.logging").error("语音产物提交失败", fields={"reason_code": "TTS_ARTIFACT_INVALID"})
+                    return {"state": "failed", **provider_failure("TTS_ARTIFACT_INVALID", error)}
                 return {"state": "succeeded", "artifact": artifact}
             if state == "cancelled":
                 return {"state": "cancelled"}
-            return {"state": "failed", "errorCode": error_code}
+            return {"state": "failed", "errorCode": error_code, "diagnostics": self._diagnostics}
         finally:
             self._disposer()
 
@@ -240,6 +246,11 @@ class _JobSupervisor:
                 body,
             )
         )
+
+    def _restart_owned_runtime(self) -> bool:
+        self._job.check_cancelled()
+        restart = getattr(self._supervisor, "_restart_owned_runtime", None)
+        return bool(restart()) if callable(restart) else False
 
 
 class _EngineQueue:
@@ -424,7 +435,7 @@ class _Coordinator:
 
     def _execute(self, job: _Job) -> None:
         source: Path | None = None
-        errors: list[str] = []
+        failure: tuple[str, BaseException | None] = ("TTS_SYNTHESIS_FAILED", None)
         try:
             job.check_cancelled()
             settings, supervisor = self._configure(job.voice)
@@ -436,10 +447,12 @@ class _Coordinator:
             job.attach_request(request)
 
             def fail(message: str) -> None:
-                errors.append(message)
+                nonlocal failure
+                # The engine invokes this callback inside its exception handler.
+                failure = (message, sys.exception())
 
             def skip(message: str) -> None:
-                errors.append("TTS_SYNTHESIS_CANCELLED" if job.cancelled else message)
+                fail("TTS_SYNTHESIS_CANCELLED" if job.cancelled else message)
 
             source = GPTSoVITSSynthesisEngine().synthesize(
                 _EngineQueue(
@@ -454,7 +467,7 @@ class _Coordinator:
             )
             job.check_cancelled()
             if source is None:
-                job.fail(errors[-1] if errors else "TTS_SYNTHESIS_FAILED")
+                job.fail(*failure)
                 return
             os.replace(source, job.output_path)
             source = None
@@ -467,7 +480,7 @@ class _Coordinator:
             job.fail("TTS_SYNTHESIS_CANCELLED")
         except Exception as error:
             self._report("tts.synthesis.failed", "error", {"reason_code": _stable_error_code(error), "error_type": type(error).__name__})
-            job.fail(getattr(error, "code", str(error)))
+            job.fail(error)
         finally:
             if source is not None:
                 source.unlink(missing_ok=True)
@@ -635,15 +648,17 @@ class GPTSoVITSProvider:
         self._diagnostics = diagnostics
         self._jobs: dict[str, _Job] = {}
         self._jobs_lock = threading.RLock()
+        self._configuration_diagnostics = {}
         try:
             self._config = _parse_config(context.config.get())
             self._coordinator: _Coordinator | None = _Coordinator(
                 self._config,
                 self._emit_diagnostic,
             )
-        except (TypeError, ValueError):
+        except (TypeError, ValueError) as error:
             self._config = None
             self._coordinator = None
+            self._configuration_diagnostics = provider_failure("TTS_PROVIDER_UNAVAILABLE", error)["diagnostics"]
 
     def status(self) -> dict[str, Any]:
         available, reason_code, stage = _config_readiness(self._config)
@@ -652,6 +667,7 @@ class GPTSoVITSProvider:
             "available": available,
             "reasonCode": reason_code,
             "stage": stage,
+            **({"diagnostics": self._configuration_diagnostics} if self._configuration_diagnostics else {}),
         }
 
     def prepareResourceUpdate(self) -> bool:
@@ -661,8 +677,10 @@ class GPTSoVITSProvider:
         return self._coordinator.finish_resources() if self._coordinator else True
 
     def begin(self, request: Mapping[str, Any]) -> str | dict[str, str]:
-        if self._config is None or not self._config.enabled or self._coordinator is None:
-            return {"errorCode": "TTS_PROVIDER_UNAVAILABLE"}
+        available, reason_code, _stage = _config_readiness(self._config)
+        if not available or self._coordinator is None:
+            return {"errorCode": reason_code if not available else "TTS_PROVIDER_UNAVAILABLE",
+                    **({"diagnostics": self._configuration_diagnostics} if self._configuration_diagnostics else {})}
         character_id = request.get("characterId")
         if not isinstance(character_id, str) or not character_id:
             return {"errorCode": "TTS_REQUEST_INVALID"}
@@ -670,13 +688,15 @@ class GPTSoVITSProvider:
             extension = self._character.get(character_id)
             voice = _parse_character_voice(self._character, character_id, extension)
         except Exception as error:
-            return {"errorCode": _stable_error_code(error)}
+            self._context.get("sakura.host.logging").error("语音声音配置读取失败", fields={"reason_code": _stable_error_code(error)})
+            return provider_failure(_stable_error_code(error), error)
         job = _Job(self._context, self._artifacts, request, voice)
         try:
             self._coordinator.submit(job)
         except Exception as error:
+            self._context.get("sakura.host.logging").error("语音任务提交失败", fields={"reason_code": _stable_error_code(error)})
             job._disposer()
-            return {"errorCode": _stable_error_code(error)}
+            return provider_failure(_stable_error_code(error), error)
         job_id = f"job_{uuid.uuid4().hex}"
         with self._jobs_lock:
             self._jobs[job_id] = job
@@ -709,6 +729,7 @@ class GPTSoVITSProvider:
                 "reasonCode": reason_code,
                 "stage": stage,
                 "errorType": "RuntimeConfigurationError",
+                **({"diagnostics": self._configuration_diagnostics} if self._configuration_diagnostics else {}),
             }
         if config is None or config.custom_base_url is not None:
             return False
@@ -722,6 +743,7 @@ class GPTSoVITSProvider:
                 "reasonCode": reason_code,
                 "stage": "character_configuration",
                 "errorType": type(error).__name__,
+                "diagnostics": provider_failure(reason_code, error)["diagnostics"],
             }
         try:
             coordinator.warmup(voice)
@@ -732,6 +754,7 @@ class GPTSoVITSProvider:
                 "reasonCode": reason_code,
                 "stage": "queue",
                 "errorType": type(error).__name__,
+                "diagnostics": provider_failure(reason_code, error)["diagnostics"],
             }
         return True
 
@@ -745,6 +768,7 @@ class GPTSoVITSProvider:
             coordinator.reconfigure(config)
         changed = self._config != config
         self._config = config
+        self._configuration_diagnostics = {}
         if changed and self._logger is not None:
             self._logger.info("语音提供方配置已更新", fields={"provider": PROVIDER_ID, "enabled": config.enabled})
         return "applied"
@@ -829,7 +853,7 @@ class GPTSoVITSPlugin:
                         "type": "select",
                         "default": "managed",
                         "options": [
-                            {"label": "Sakura 内置", "value": "managed"},
+                            {"label": "插件管理的本地服务", "value": "managed"},
                             {"label": "连接已有服务", "value": "custom"},
                         ],
                     },
@@ -852,6 +876,7 @@ class GPTSoVITSPlugin:
             config_update=context.config.update,
             entry=recommend_gpt_sovits_bundle,
             custom_endpoint=_uses_custom_endpoint,
+            diagnostic=provider._emit_diagnostic,
         )
         context.effect(bundle.close)
         settings.register(
@@ -996,6 +1021,7 @@ def _parse_character_voice(
     tone_refs_path = Path(character.resolve_resource(character_id, tone_refs_relative))
     package_dir = _package_root(tone_refs_path, tone_refs_relative)
     references: dict[str, list[ToneReference]] = {}
+    resource_paths = [tone_refs_relative]
     for raw_line in tone_refs_path.read_text(encoding="utf-8").splitlines():
         line = raw_line.strip()
         if not line or line.startswith("#"):
@@ -1005,6 +1031,7 @@ def _parse_character_voice(
             raise ValueError("TTS_CHARACTER_CONFIG_INVALID")
         audio_relative, language, text, tone = parts
         audio_path = Path(character.resolve_resource(character_id, audio_relative))
+        resource_paths.append(audio_relative)
         references.setdefault(tone, []).append(
             ToneReference(tone, audio_path, text, language.lower())
         )
@@ -1012,7 +1039,7 @@ def _parse_character_voice(
     if not flattened:
         raise ValueError("TTS_CHARACTER_CONFIG_INVALID")
     neutral = references.get(DEFAULT_TONE, flattened)[0]
-    return _CharacterVoice(
+    voice = _CharacterVoice(
         character_id=character_id,
         package_dir=package_dir,
         ref_text_path=tone_refs_path,
@@ -1024,6 +1051,13 @@ def _parse_character_voice(
         gpt_model_path=_character_resource(character, character_id, extension.get("gptModel")),
         sovits_model_path=_character_resource(character, character_id, extension.get("sovitsModel")),
     )
+    resource_paths.extend(extension[key] for key in ("gptModel", "sovitsModel") if extension.get(key))
+    requirements = [{"kind": "tts", "type": "gpt-sovits.models@1", "plugins": [
+        {"id": PROVIDER_ID, "name": "GPT-SoVITS"}, {"id": "sakura.tts.genie", "name": "Genie"},
+        {"id": "sakura.tts.sakuratts", "name": "SakuraTTS"},
+    ]}] if voice.gpt_model_path is not None and voice.sovits_model_path is not None else []
+    character.declare_resources(character_id, {"kind": "tts", "paths": resource_paths, "pluginRequirements": requirements})
+    return voice
 
 
 def _character_resource(character: object, character_id: str, value: object) -> Path | None:
